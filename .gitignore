@@ -1,3 +1,5 @@
 .DS_Store
 node_modules/
 config.js
+1me-images/*
+1me-images-out/*
