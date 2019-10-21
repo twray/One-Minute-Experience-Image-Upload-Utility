@@ -21,6 +21,9 @@ const {
   AZURE_CV_TRAINING_KEY,
   AZURE_CV_PREDICTION_RESOURCE_ID,
   AZURE_CV_ENDPOINT,
+  DIRECTUS_API_ENDPOINT,
+  DIRECTUS_API_PROJECT_NAME,
+  DIRECTUS_COLLECTION,
   DIRECTUS_EMAIL,
   DIRECTUS_PASSWORD
 } = require('./config');
@@ -29,6 +32,8 @@ const TrainingApiClient = require("@azure/cognitiveservices-customvision-trainin
 
 const log = console.log;
 const err = console.error;
+
+let authToken;
 
 const main = async () => {
 
@@ -42,7 +47,6 @@ const main = async () => {
   const imageFilename = imageFileAnswers.image_file;
 
   if (
-    true || // temp
     fs.existsSync(IN_PATH + imageFilename) &&
     SUPPORTED_IMAGE_EXTENSIONS.includes(
       path.extname(IN_PATH + imageFilename).toLowerCase()
@@ -71,15 +75,20 @@ const main = async () => {
 
     const artwork = await inquirer.prompt(metadataQuestions);
 
-    console.log(`\nCreating training data-set ... `);
+    log(`\nCreating training data-set ... `);
+    await processImage(imageFilename);
 
-    await processImage('piet-mondrian-the-red-tree.jpg');
+    log(`\nAdding work ${artwork.artist_name}: ${artwork.title} to database ... `);
+    const artworkId = await addToDatabase(artwork, imageFilename);
 
-    console.log(`\nAdding work ${artwork.artist_name}: ${artwork.title} to database ... `);
+    log(`\nUploading images to Custom Vision ...`);
+    const tagId = await uploadImagesToCustomVision(artworkId, artwork.artist_name, artwork.title);
 
-    await addToDatabase(artwork, imageFilename);
+    log(`\nLinking artwork to machine learning model ...`);
+    await addTagToArtwork(tagId, artworkId);
 
-    await uploadImagesToCustomVision(199, 'Piet Mondrian', 'The Red Tree');
+    log(`\nCleaning up resources ...`);
+    await cleanUpResources();
 
   } else {
 
@@ -89,13 +98,28 @@ const main = async () => {
 
 };
 
-const addToDatabase = async (artwork, imageFilename, tagId) => {
+const getAuthenticationHeader = async () => {
 
-  console.log();
-  console.log('NOTE: The OneMinuteExperience extension must be disabled in');
-  console.log('order for this to work. Please ensure that you re-enable all');
-  console.log('extensions after doing this.');
-  console.log();
+  if (!authToken) {
+
+    const authenticationResponse = await axios.post(
+      `${DIRECTUS_API_ENDPOINT}${DIRECTUS_API_PROJECT_NAME}/auth/authenticate`, {
+        email: DIRECTUS_EMAIL,
+        password: DIRECTUS_PASSWORD
+      }
+    );
+
+    authToken = authenticationResponse.data.data.token;
+
+  }
+
+  return {
+    'Authorization': 'Bearer ' + authToken
+  };
+
+};
+
+const addToDatabase = async (artwork, imageFilename, tagId) => {
 
   // Add artwork to Directus DB
 
@@ -103,17 +127,7 @@ const addToDatabase = async (artwork, imageFilename, tagId) => {
 
     // Authenticate, retrieve access token
 
-    const authenticationResponse = await axios.post(
-      'https://modgift.itu.dk/1mev2/_/auth/authenticate', {
-        email: DIRECTUS_EMAIL,
-        password: DIRECTUS_PASSWORD
-      }
-    );
-
-    const token = authenticationResponse.data.data.token;
-    const authHeader = {
-      'Authorization': 'Bearer ' + token
-    };
+    const authHeader = await getAuthenticationHeader();
 
     // Upload its image
 
@@ -122,7 +136,7 @@ const addToDatabase = async (artwork, imageFilename, tagId) => {
     });
 
     const uploadImageResponse = await axios.post(
-      'https://modgift.itu.dk/1mev2/_/files',
+      `${DIRECTUS_API_ENDPOINT}${DIRECTUS_API_PROJECT_NAME}/files`,
       {
         filename: imageFilename,
         data: imageData
@@ -135,14 +149,29 @@ const addToDatabase = async (artwork, imageFilename, tagId) => {
     // Add the artwork to the database
 
     const createArtworkResponse = await axios.post(
-      'https://modgift.itu.dk/1mev2/_/items/artwork',
+      `${DIRECTUS_API_ENDPOINT}${DIRECTUS_API_PROJECT_NAME}/items/${DIRECTUS_COLLECTION}`,
       {...artwork, status: 'published', image: imageFileID},
       {headers: authHeader}
     );
 
+    const artworkID = createArtworkResponse.data.data.id;
+    return artworkID;
+
   } catch (e) {
-    console.log(e);
+    log(e);
   }
+
+}
+
+const addTagToArtwork = async (tagId, artworkId) => {
+
+  const authHeader = await getAuthenticationHeader();
+
+  const updateArtworkResponse = await axios.patch(
+    `${DIRECTUS_API_ENDPOINT}${DIRECTUS_API_PROJECT_NAME}/items/${DIRECTUS_COLLECTION}/${artworkId}`,
+    {image_recognition_tag_id: tagId},
+    {headers: authHeader}
+  );
 
 }
 
@@ -361,6 +390,12 @@ const saveImage = (canvas, filepath, suffix) => {
 
 };
 
+const cleanUpResources = () => {
+
+  fs.readdirSync(OUT_PATH).forEach(file => fs.unlinkSync(OUT_PATH + file));
+
+};
+
 const uploadImagesToCustomVision = async (id, artist, title) => {
 
   const trainer = new TrainingApiClient.TrainingAPIClient(
@@ -396,41 +431,53 @@ const uploadImagesToCustomVision = async (id, artist, title) => {
 
   }
 
-  let trainingIteration = await trainer.trainProject(AZURE_CV_PROJECT_ID);
+  const tags = await trainer.getTags(AZURE_CV_PROJECT_ID);
 
-  while (trainingIteration.status === 'Training') {
-    await sleep(1500);
-    trainingIteration = await trainer.getIteration(
+  if (tags.length >= 2) {
+
+    let trainingIteration = await trainer.trainProject(AZURE_CV_PROJECT_ID);
+
+    while (trainingIteration.status === 'Training') {
+      await sleep(1500);
+      trainingIteration = await trainer.getIteration(
+        AZURE_CV_PROJECT_ID,
+        trainingIteration.id
+      )
+    }
+
+    const iterations = await trainer.getIterations(AZURE_CV_PROJECT_ID);
+    const testingIteration = iterations.find(iteration => iteration.publishName === 'testing');
+
+    if (testingIteration) {
+
+      const testingIterationId = testingIteration.id;
+
+      await trainer.unpublishIteration(
+        AZURE_CV_PROJECT_ID,
+        testingIterationId
+      );
+
+      await trainer.deleteIteration(
+        AZURE_CV_PROJECT_ID,
+        testingIterationId
+      );
+
+    }
+
+    await trainer.publishIteration(
       AZURE_CV_PROJECT_ID,
-      trainingIteration.id
-    )
-  }
-
-  const iterations = await trainer.getIterations(AZURE_CV_PROJECT_ID);
-  const testingIteration = iterations.find(iteration => iteration.publishName === 'testing');
-
-  if (testingIteration) {
-
-    const testingIterationId = testingIteration.id;
-
-    await trainer.unpublishIteration(
-      AZURE_CV_PROJECT_ID,
-      testingIterationId
+      trainingIteration.id,
+      'testing',
+      AZURE_CV_PREDICTION_RESOURCE_ID
     );
 
-    await trainer.deleteIteration(
-      AZURE_CV_PROJECT_ID,
-      testingIterationId
-    );
+  } else {
+
+    log(`\nModel will not be trained, as there is only one object in the database`);
 
   }
 
-  await trainer.publishIteration(
-    AZURE_CV_PROJECT_ID,
-    trainingIteration.id,
-    'testing',
-    AZURE_CV_PREDICTION_RESOURCE_ID
-  );
+  return tagId;
 
 }
 

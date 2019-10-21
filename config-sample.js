@@ -21,6 +21,15 @@ module.exports = {
   // Your Azure CustomVision Endpoint
   AZURE_CV_ENDPOINT: '[your-azure-cv-endpoint]',
 
+  // Directus API Endpoint
+  DIRECTUS_API_ENDPOINT: '[your-directus-api-endpoint]',
+
+  // Directus Collection
+  DIRECTUS_API_PROJECT_NAME: '[your-directus-api-project-name]',
+
+  // Directus Table
+  DIRECTUS_COLLECTION: '[directus-collection]',
+
   // E-mail / username to log into the Directus back-end
   DIRECTUS_EMAIL: '[your-directus-email-address]',
 
